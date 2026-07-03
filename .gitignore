@@ -1,0 +1,92 @@
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio cache/options
+.vs/
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Rider
+.idea/
+*.sln.iml
+*.DotSettings.user
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Visual Studio project settings
+*.vbproj.user
+*.csproj.user
+*.vcxproj.user
+*.vcxproj.filters.user
+*.proj.user
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+
+# Test Results
+TestResults/
+*.trx
+*.coverage
+
+# IDE-specific
+.DS_Store
+Thumbs.db
+
+# Local environment files
+appsettings.Development.json
+.env
+.env.local
+.env.*.local
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS specific
+.DS_Store
+desktop.ini
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# IDE Generated files
+.vscode/
+.vs/
+
+# Application-specific
+Data/
+Models/
+SQL/

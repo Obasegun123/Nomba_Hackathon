@@ -1,0 +1,46 @@
+services:
+  # The PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: nomba-db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: securepassword123
+      POSTGRES_DB: nomba_ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # The Redis Cache (for Idempotency)
+  redis:
+    image: redis:7-alpine
+    container_name: nomba-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  # Chaos-testing proxy: sits between the (host-run) app and Postgres/Redis so
+  # the "Network Storm" resilience test can inject latency/packet loss without
+  # touching the containers themselves. Admin API on 8474; proxied ports mirror
+  # the real services on 15432 (-> postgres:5432) and 16379 (-> redis:6379),
+  # configured at runtime via the admin API (see scripts/test-network-storm.ps1).
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: nomba-toxiproxy
+    restart: always
+    ports:
+      - "8474:8474"
+      - "15432:15432"
+      - "16379:16379"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
