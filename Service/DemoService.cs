@@ -23,9 +23,8 @@ public class DemoService
         var startTime = DateTimeOffset.UtcNow;
         var timestamp = startTime.ToString("yyyyMMddHHmmss");
 
-        using var transaction = await _db.Database.BeginTransactionAsync();
-
-        try
+        var strategy = _db.Database.CreateExecutionStrategy();
+        return await strategy.ExecuteAsync(async () =>
         {
             var rand = seed.HasValue ? new Random(seed.Value) : new Random();
             var testTransactions = GenerateTestTransactions(20, timestamp, rand);
@@ -105,8 +104,6 @@ public class DemoService
                 }
             }
 
-            await transaction.CommitAsync();
-
             var report = new SettlementAccuracyReport
             {
                 TestRunId = Guid.NewGuid().ToString(),
@@ -140,13 +137,7 @@ public class DemoService
                 report.Matched, settlements.Count, report.MatchRate, report.LedgerBalanced);
 
             return report;
-        }
-        catch (Exception ex)
-        {
-            await transaction.RollbackAsync();
-            _logger.LogError(ex, "Demo settlement accuracy test failed");
-            throw;
-        }
+        });
     }
 
     private List<(string ReferenceCode, string AccountId, decimal Amount, string Status)> GenerateTestTransactions(

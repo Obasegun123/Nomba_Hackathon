@@ -20,6 +20,7 @@ var pgConn = config.GetConnectionString("Postgres")
 var redisConn = config.GetConnectionString("Redis") ?? "localhost:6379";
 
 builder.Services.Configure<NombaOptions>(config.GetSection("Nomba"));
+builder.Services.Configure<EmailOptions>(config.GetSection("Email"));
 
 // OpenAPI / Swagger
 builder.Services.AddEndpointsApiExplorer();
@@ -59,6 +60,9 @@ builder.Services.AddScoped<FuzzyMatchingService>();
 builder.Services.AddScoped<WebhookEventPublisher>();
 builder.Services.AddScoped<CsvStatementExporter>();
 builder.Services.AddScoped<HtmlStatementExporter>();
+builder.Services.AddScoped<PdfStatementGenerator>();
+builder.Services.AddScoped<MonthlyStatementService>();
+builder.Services.AddScoped<IEmailService, EmailService>();
 builder.Services.AddHttpClient<WebhookEventPublisher>();
 
 // LLM provider for exception analysis (optional, configured via LLM:QwenApiKey secret)
@@ -141,6 +145,11 @@ RecurringJob.AddOrUpdate<ReconciliationService>(
 // Recurring webhook delivery retry every minute.
 RecurringJob.AddOrUpdate<WebhookEventPublisher>(
     "webhook-retry", svc => svc.RetryPendingEventsAsync(), "* * * * *");
+
+// Monthly statement send on the 28th of each month at 11 PM UTC
+// (28th ensures it runs before month-end for all months including February)
+RecurringJob.AddOrUpdate<MonthlyStatementService>(
+    "monthly-statements", svc => svc.SendMonthlyStatementsAsync(), "0 23 28 * *");
 
 app.MapPost("/webhooks/nomba", async (
     HttpContext context,
@@ -540,8 +549,32 @@ app.MapPost("/customers", async (CreateCustomerRequest req, LedgerDbContext db) 
 app.MapGet("/customers/{id}", async (string id, LedgerDbContext db) =>
 {
     var customer = await db.Customers
-        .Include(c => c.VirtualAccounts)
-        .FirstOrDefaultAsync(c => c.Id == id);
+        .Where(c => c.Id == id)
+        .Select(c => new
+        {
+            c.Id,
+            c.Name,
+            c.Email,
+            c.PhoneNumber,
+            c.KycTier,
+            c.DailyLimit,
+            c.Status,
+            c.CreatedAt,
+            c.UpdatedAt,
+            VirtualAccounts = c.VirtualAccounts.Select(va => new
+            {
+                va.AccountRef,
+                va.AccountName,
+                va.Status,
+                va.KycTier,
+                va.Nuban,
+                va.BankCode,
+                va.BankName,
+                va.CreatedAt,
+                va.UpdatedAt
+            })
+        })
+        .FirstOrDefaultAsync();
 
     return customer is null
         ? Results.NotFound(new { error = "Customer not found" })
@@ -622,7 +655,7 @@ app.MapPost("/virtual-accounts", async (
         return Results.BadRequest(new { error = ex.Message });
     }
 })
-.WithTags("Accounts").WithName("CreateVirtualAccount")
+.WithTags("Accounts").WithName("CreateCustomerVirtualAccount")
 .WithSummary("Provision a new virtual account for a customer.")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
@@ -736,6 +769,30 @@ app.MapGet("/customers/{customerId}/statement/html", async (
 .WithSummary("Export customer statement as HTML (can be printed/saved as PDF).")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
+// Export customer statement as PDF
+app.MapGet("/customers/{customerId}/statement/pdf", async (
+    string customerId,
+    PdfStatementGenerator generator,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var pdf = await generator.GenerateCustomerStatementAsync(customerId, from, to);
+        return Results.File(
+            pdf,
+            "application/pdf",
+            $"statement_{customerId}_{DateTimeOffset.UtcNow:yyyyMMdd}.pdf");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportCustomerStatementPdf")
+.WithSummary("Export customer statement as PDF with optional date range filtering.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
 // Export account statement as CSV
 app.MapGet("/account/{accountRef}/statement/csv", async (
     string accountRef,
@@ -779,6 +836,30 @@ app.MapGet("/account/{accountRef}/statement/html", async (
 })
 .WithTags("Reporting").WithName("ExportAccountStatementHtml")
 .WithSummary("Export virtual account statement as HTML (can be printed/saved as PDF).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Export account statement as PDF
+app.MapGet("/account/{accountRef}/statement/pdf", async (
+    string accountRef,
+    PdfStatementGenerator generator,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var pdf = await generator.GenerateAccountStatementAsync(accountRef, from, to);
+        return Results.File(
+            pdf,
+            "application/pdf",
+            $"account_statement_{accountRef}_{DateTimeOffset.UtcNow:yyyyMMdd}.pdf");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportAccountStatementPdf")
+.WithSummary("Export virtual account statement as PDF with optional date range filtering.")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/misdirected-payments", async (LedgerDbContext db, string? status, int page = 1, int pageSize = 50) =>
