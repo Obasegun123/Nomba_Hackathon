@@ -87,6 +87,4 @@ docker-compose.override.yml
 .vs/
 
 # Application-specific
-Data/
-Models/
-SQL/
+# Data/, Models/, SQL/ - NOW COMMITTED (needed for builds)
