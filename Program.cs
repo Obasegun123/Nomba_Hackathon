@@ -53,8 +53,31 @@ builder.Services.AddScoped<IIdempotencyService, IdempotencyService>();
 
 // Ledger + reconciliation services
 builder.Services.AddScoped<PaymentService>();
-builder.Services.AddScoped<ReconciliationService>();
 builder.Services.AddScoped<LedgerQueryService>();
+builder.Services.AddScoped<VirtualAccountService>();
+builder.Services.AddScoped<FuzzyMatchingService>();
+builder.Services.AddScoped<WebhookEventPublisher>();
+builder.Services.AddScoped<CsvStatementExporter>();
+builder.Services.AddScoped<HtmlStatementExporter>();
+builder.Services.AddHttpClient<WebhookEventPublisher>();
+
+// LLM provider for exception analysis (optional, configured via LLM:QwenApiKey secret)
+if (!string.IsNullOrEmpty(config["LLM:QwenApiKey"]))
+{
+    builder.Services.AddHttpClient<QwenLlmProvider>();
+    builder.Services.AddScoped<ILlmProvider, QwenLlmProvider>();
+}
+
+// Slack notifications for exceptions (optional, configured via Slack:WebhookUrl secret)
+if (!string.IsNullOrEmpty(config["Slack:WebhookUrl"]))
+{
+    builder.Services.AddHttpClient<SlackNotificationService>();
+    builder.Services.AddScoped<ISlackNotificationService, SlackNotificationService>();
+}
+
+builder.Services.AddScoped<ReconciliationService>();
+builder.Services.AddScoped<AuditService>();
+builder.Services.AddScoped<DemoService>();
 
 // Multi-provider abstraction: NombaClient is the reference implementation.
 // Register additional IPaymentProvider implementations here to add providers.
@@ -115,6 +138,10 @@ app.UseHangfireDashboard("/hangfire");
 RecurringJob.AddOrUpdate<ReconciliationService>(
     "reconcile-pending", svc => svc.ReconcilePendingAsync(), "*/5 * * * *");
 
+// Recurring webhook delivery retry every minute.
+RecurringJob.AddOrUpdate<WebhookEventPublisher>(
+    "webhook-retry", svc => svc.RetryPendingEventsAsync(), "* * * * *");
+
 app.MapPost("/webhooks/nomba", async (
     HttpContext context,
     IOptions<NombaOptions> opts,
@@ -164,10 +191,18 @@ app.MapPost("/webhooks/nomba", async (
 
     app.Logger.LogInformation("Nomba webhook verified: {EventType}", eventType);
 
+    if (IsReversalEvent(eventType))
+    {
+        await hangfireEnqueueRetry.ExecuteAsync(() =>
+        {
+            jobs.Enqueue<PaymentService>(svc => svc.ProcessReversalAsync(body));
+            return Task.CompletedTask;
+        });
+    }
     // Only money-in events credit the ledger (payment_success,
     // virtual_account.funded, mandate.debit_success). Outbound transfers
     // (transfer.success/failed) settle money OUT and are never booked here.
-    if (IsMoneyInEvent(eventType))
+    else if (IsMoneyInEvent(eventType))
     {
         // Hangfire.PostgreSql opens its own raw Npgsql connection to persist the
         // job row — it is NOT covered by the EF Core EnableRetryOnFailure
@@ -186,6 +221,98 @@ app.MapPost("/webhooks/nomba", async (
 .WithTags("Webhooks")
 .WithName("HandleNombaWebhook")
 .WithSummary("Receive and verify a signed Nomba payment webhook. Idempotent — re-deliveries are ignored.");
+
+// Register a webhook subscription to receive virtual account events
+app.MapPost("/webhooks/subscribe", async (
+    CreateWebhookSubscriptionRequest req,
+    LedgerDbContext db) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Url))
+        return Results.BadRequest(new { error = "url is required" });
+
+    var existing = await db.WebhookSubscriptions.FirstOrDefaultAsync(s => s.Url == req.Url);
+    if (existing is not null)
+        return Results.BadRequest(new { error = "Subscription for this URL already exists" });
+
+    var subscription = new WebhookSubscription
+    {
+        Id = Guid.NewGuid(),
+        Url = req.Url,
+        Secret = req.Secret ?? Guid.NewGuid().ToString("N"),
+        Status = "ACTIVE",
+        CreatedAt = DateTimeOffset.UtcNow
+    };
+
+    db.WebhookSubscriptions.Add(subscription);
+    await db.SaveChangesAsync();
+
+    return Results.Created($"/webhooks/subscriptions/{subscription.Id}", new
+    {
+        id = subscription.Id,
+        url = subscription.Url,
+        secret = subscription.Secret,
+        status = subscription.Status,
+        createdAt = subscription.CreatedAt
+    });
+})
+.WithTags("Webhooks").WithName("SubscribeToWebhooks")
+.WithSummary("Register a webhook endpoint to receive virtual account events.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// List webhook subscriptions
+app.MapGet("/webhooks/subscriptions", async (LedgerDbContext db) =>
+{
+    var subscriptions = await db.WebhookSubscriptions.ToListAsync();
+    return Results.Ok(subscriptions);
+})
+.WithTags("Webhooks").WithName("ListWebhookSubscriptions")
+.WithSummary("List all registered webhook subscriptions.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Delete a webhook subscription
+app.MapDelete("/webhooks/subscriptions/{id:guid}", async (Guid id, LedgerDbContext db) =>
+{
+    var subscription = await db.WebhookSubscriptions.FindAsync(id);
+    if (subscription is null)
+        return Results.NotFound(new { error = "Subscription not found" });
+
+    db.WebhookSubscriptions.Remove(subscription);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new { id, status = "deleted" });
+})
+.WithTags("Webhooks").WithName("DeleteWebhookSubscription")
+.WithSummary("Remove a webhook subscription.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// List webhook events
+app.MapGet("/webhooks/events", async (
+    LedgerDbContext db,
+    string? status,
+    string? eventType,
+    int page = 1,
+    int pageSize = 50) =>
+{
+    var query = db.WebhookEvents.AsQueryable();
+
+    if (!string.IsNullOrEmpty(status))
+        query = query.Where(e => e.Status == status);
+
+    if (!string.IsNullOrEmpty(eventType))
+        query = query.Where(e => e.EventType == eventType);
+
+    var total = await query.CountAsync();
+    var items = await query
+        .OrderByDescending(e => e.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync();
+
+    return Results.Ok(new { total, page, pageSize, items });
+})
+.WithTags("Webhooks").WithName("ListWebhookEvents")
+.WithSummary("List webhook events with optional filtering by status or type.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
 
 // Phase 1 — initiate a payment into a (reserved) virtual account. Persists a
 // PENDING header so the credit webhook (or reconciliation) can settle it later.
@@ -210,6 +337,23 @@ app.MapPost("/payments/virtual-account", async (
 
     var account = await nomba.CreateVirtualAccountAsync(body);
 
+    var nuban = account?["bankAccountNumber"]?.GetValue<string>() ?? account?["accountNumber"]?.GetValue<string>();
+    var bankCode = account?["bankCode"]?.GetValue<string>();
+    var bankName = account?["bankName"]?.GetValue<string>();
+
+    // Validate NUBAN is a 10-digit account number (Nigeria standard)
+    if (!string.IsNullOrEmpty(nuban) && !System.Text.RegularExpressions.Regex.IsMatch(nuban, @"^\d{10}$"))
+    {
+        app.Logger.LogWarning(
+            "Nomba returned non-standard NUBAN {Nuban} for account {Ref}", nuban, req.AccountRef);
+    }
+
+    if (!string.IsNullOrEmpty(nuban))
+    {
+        app.Logger.LogInformation(
+            "Created virtual account {Ref} with NUBAN {Nuban} at {BankName}", req.AccountRef, nuban, bankName);
+    }
+
     // Register in the local account registry (upsert: update name if already exists).
     var existing = await db.VirtualAccounts.FindAsync(req.AccountRef);
     if (existing is null)
@@ -220,6 +364,9 @@ app.MapPost("/payments/virtual-account", async (
             AccountName = req.AccountName,
             Status = "ACTIVE",
             KycTier = 1,
+            Nuban = nuban,
+            BankCode = bankCode,
+            BankName = bankName,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
         });
@@ -227,6 +374,9 @@ app.MapPost("/payments/virtual-account", async (
     else
     {
         existing.AccountName = req.AccountName;
+        existing.Nuban = nuban ?? existing.Nuban;
+        existing.BankCode = bankCode ?? existing.BankCode;
+        existing.BankName = bankName ?? existing.BankName;
         existing.UpdatedAt = DateTimeOffset.UtcNow;
     }
     await db.SaveChangesAsync();
@@ -300,13 +450,15 @@ app.MapGet("/account/{id}", async (string id, LedgerDbContext db) =>
 app.MapMethods("/account/{id}", ["PATCH"], async (
     string id,
     UpdateAccountRequest req,
-    LedgerDbContext db) =>
+    LedgerDbContext db,
+    AuditService audit) =>
 {
     var account = await db.VirtualAccounts.FindAsync(id);
     if (account is null)
         return Results.NotFound(new { error = "Account not found" });
 
     var updated = new List<string>();
+    var oldAccountName = account.AccountName;
 
     if (!string.IsNullOrWhiteSpace(req.AccountName) && req.AccountName != account.AccountName)
     {
@@ -333,6 +485,9 @@ app.MapMethods("/account/{id}", ["PATCH"], async (
     account.UpdatedAt = DateTimeOffset.UtcNow;
     await db.SaveChangesAsync();
 
+    if (oldAccountName != account.AccountName)
+        await audit.RecordIdentityChangeAsync(id, "virtual_account", "account_name", oldAccountName, account.AccountName);
+
     return Results.Ok(new { accountRef = id, updated, account });
 })
 .WithTags("Accounts").WithName("UpdateAccount")
@@ -345,11 +500,397 @@ app.MapGet("/account/{id}/balance", async (string id, LedgerQueryService queries
 .WithSummary("Live balance computed from the double-entry ledger: totalCredit - totalDebit.")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
+app.MapPost("/customers", async (CreateCustomerRequest req, LedgerDbContext db) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Name) || string.IsNullOrWhiteSpace(req.Email))
+        return Results.BadRequest(new { error = "name and email are required" });
+
+    var exists = await db.Customers.AnyAsync(c => c.Email == req.Email);
+    if (exists)
+        return Results.BadRequest(new { error = "Customer with this email already exists" });
+
+    var customer = new Customer
+    {
+        Id = Guid.NewGuid().ToString("N").Substring(0, 20),
+        Name = req.Name,
+        Email = req.Email,
+        PhoneNumber = req.PhoneNumber,
+        KycTier = req.KycTier ?? 1,
+        DailyLimit = req.KycTier switch
+        {
+            1 => 50000m,
+            2 => 200000m,
+            3 => decimal.MaxValue,
+            _ => 50000m
+        },
+        Status = "ACTIVE",
+        CreatedAt = DateTimeOffset.UtcNow,
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
+
+    db.Customers.Add(customer);
+    await db.SaveChangesAsync();
+
+    return Results.Created($"/customers/{customer.Id}", customer);
+})
+.WithTags("Customers").WithName("CreateCustomer")
+.WithSummary("Create a new customer with KYC tier and daily limit.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/customers/{id}", async (string id, LedgerDbContext db) =>
+{
+    var customer = await db.Customers
+        .Include(c => c.VirtualAccounts)
+        .FirstOrDefaultAsync(c => c.Id == id);
+
+    return customer is null
+        ? Results.NotFound(new { error = "Customer not found" })
+        : Results.Ok(customer);
+})
+.WithTags("Customers").WithName("GetCustomer")
+.WithSummary("Get customer details including all linked virtual accounts.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapPatch("/customers/{id}", async (string id, UpdateCustomerRequest req, LedgerDbContext db, AuditService audit) =>
+{
+    var customer = await db.Customers.FindAsync(id);
+    if (customer is null)
+        return Results.NotFound(new { error = "Customer not found" });
+
+    var updated = new List<string>();
+    var oldName = customer.Name;
+    var oldKycTier = customer.KycTier;
+
+    if (!string.IsNullOrWhiteSpace(req.Name) && req.Name != customer.Name)
+    {
+        customer.Name = req.Name;
+        updated.Add("name");
+    }
+
+    if (req.KycTier is not null && req.KycTier >= 1 && req.KycTier <= 3)
+    {
+        customer.KycTier = req.KycTier.Value;
+        customer.DailyLimit = req.KycTier switch
+        {
+            1 => 50000m,
+            2 => 200000m,
+            3 => decimal.MaxValue,
+            _ => customer.DailyLimit
+        };
+        updated.Add("kycTier");
+        updated.Add("dailyLimit");
+    }
+
+    if (!string.IsNullOrWhiteSpace(req.Status) && req.Status != customer.Status)
+    {
+        if (req.Status is not ("ACTIVE" or "INACTIVE" or "SUSPENDED"))
+            return Results.BadRequest(new { error = "status must be ACTIVE, INACTIVE, or SUSPENDED" });
+        customer.Status = req.Status;
+        updated.Add("status");
+    }
+
+    customer.UpdatedAt = DateTimeOffset.UtcNow;
+    await db.SaveChangesAsync();
+
+    if (oldName != customer.Name)
+        await audit.RecordIdentityChangeAsync(id, "customer", "name", oldName, customer.Name);
+
+    if (oldKycTier != customer.KycTier)
+        await audit.RecordKycTierChangeAsync(id, oldKycTier, customer.KycTier, req.KycTierReason ?? "");
+
+    return Results.Ok(new { customerId = id, updated, customer });
+})
+.WithTags("Customers").WithName("UpdateCustomer")
+.WithSummary("Update customer name, KYC tier, or account status.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapPost("/virtual-accounts", async (
+    CreateVirtualAccountRequest req,
+    VirtualAccountService vaService,
+    LedgerDbContext db) =>
+{
+    if (string.IsNullOrWhiteSpace(req.CustomerId) || string.IsNullOrWhiteSpace(req.AccountName))
+        return Results.BadRequest(new { error = "customerId and accountName are required" });
+
+    try
+    {
+        var account = await vaService.ProvisionAsync(req.CustomerId, req.AccountName, req.Amount ?? 0);
+        return Results.Created($"/account/{account.AccountRef}", account);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+})
+.WithTags("Accounts").WithName("CreateVirtualAccount")
+.WithSummary("Provision a new virtual account for a customer.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/customers/{customerId}/accounts", async (string customerId, LedgerDbContext db) =>
+{
+    var accounts = await db.VirtualAccounts
+        .Where(a => a.CustomerId == customerId)
+        .OrderByDescending(a => a.CreatedAt)
+        .ToListAsync();
+
+    return Results.Ok(new { customerId, accounts });
+})
+.WithTags("Accounts").WithName("ListCustomerAccounts")
+.WithSummary("List all virtual accounts for a customer.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/customers/{customerId}/statement", async (
+    string customerId,
+    LedgerDbContext db,
+    LedgerQueryService queries,
+    int page = 1,
+    int pageSize = 50) =>
+{
+    var customer = await db.Customers.FindAsync(customerId);
+    if (customer is null)
+        return Results.NotFound(new { error = "Customer not found" });
+
+    var accounts = await db.VirtualAccounts
+        .Where(a => a.CustomerId == customerId)
+        .Select(a => a.AccountRef)
+        .ToListAsync();
+
+    if (accounts.Count == 0)
+        return Results.Ok(new
+        {
+            customerId,
+            customerName = customer.Name,
+            totalBalance = 0m,
+            accounts = new object[] { },
+            transactions = new object[] { },
+            generatedAt = DateTimeOffset.UtcNow
+        });
+
+    var accountDetails = await Task.WhenAll(accounts.Select(async a =>
+        new
+        {
+            accountRef = a,
+            balance = await queries.GetBalanceAsync(a)
+        }));
+
+    var totalBalance = accountDetails.Sum(a => a.balance?.Balance ?? 0m);
+
+    var transactions = await queries.GetTransactionsAsync(null, null, page, pageSize);
+
+    return Results.Ok(new
+    {
+        customerId,
+        customerName = customer.Name,
+        totalBalance,
+        accounts = accountDetails,
+        transactions = transactions.Items,
+        generatedAt = DateTimeOffset.UtcNow
+    });
+})
+.WithTags("Reporting").WithName("GetCustomerStatement")
+.WithSummary("Generate a customer statement: all virtual accounts, balances, and transaction history.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Export customer statement as CSV
+app.MapGet("/customers/{customerId}/statement/csv", async (
+    string customerId,
+    CsvStatementExporter exporter,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var csv = await exporter.GenerateCustomerStatementAsync(customerId, from, to);
+        return Results.File(
+            System.Text.Encoding.UTF8.GetBytes(csv),
+            "text/csv",
+            $"statement_{customerId}_{DateTimeOffset.UtcNow:yyyyMMdd}.csv");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportCustomerStatementCsv")
+.WithSummary("Export customer statement as CSV with optional date range filtering.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Export customer statement as HTML (can be printed to PDF)
+app.MapGet("/customers/{customerId}/statement/html", async (
+    string customerId,
+    HtmlStatementExporter exporter,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var html = await exporter.GenerateCustomerStatementAsync(customerId, from, to);
+        return Results.Content(html, "text/html; charset=utf-8");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportCustomerStatementHtml")
+.WithSummary("Export customer statement as HTML (can be printed/saved as PDF).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Export account statement as CSV
+app.MapGet("/account/{accountRef}/statement/csv", async (
+    string accountRef,
+    CsvStatementExporter exporter,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var csv = await exporter.GenerateAccountStatementAsync(accountRef, from, to);
+        return Results.File(
+            System.Text.Encoding.UTF8.GetBytes(csv),
+            "text/csv",
+            $"account_statement_{accountRef}_{DateTimeOffset.UtcNow:yyyyMMdd}.csv");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportAccountStatementCsv")
+.WithSummary("Export virtual account statement as CSV with optional date range filtering.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Export account statement as HTML
+app.MapGet("/account/{accountRef}/statement/html", async (
+    string accountRef,
+    HtmlStatementExporter exporter,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    try
+    {
+        var html = await exporter.GenerateAccountStatementAsync(accountRef, from, to);
+        return Results.Content(html, "text/html; charset=utf-8");
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+})
+.WithTags("Reporting").WithName("ExportAccountStatementHtml")
+.WithSummary("Export virtual account statement as HTML (can be printed/saved as PDF).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/misdirected-payments", async (LedgerDbContext db, string? status, int page = 1, int pageSize = 50) =>
+{
+    var query = db.MisdirectedPayments.AsQueryable();
+
+    if (!string.IsNullOrEmpty(status))
+        query = query.Where(m => m.Status == status);
+
+    var total = await query.CountAsync();
+    var items = await query
+        .OrderByDescending(m => m.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync();
+
+    return Results.Ok(new { total, page, pageSize, items });
+})
+.WithTags("Reconciliation").WithName("ListMisdirectedPayments")
+.WithSummary("List misdirected payments (payments to inactive/non-existent accounts).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapPatch("/misdirected-payments/{id:guid}/resolve", async (
+    Guid id,
+    ResolveMisdirectedRequest req,
+    LedgerDbContext db) =>
+{
+    var payment = await db.MisdirectedPayments.FindAsync(id);
+    if (payment is null)
+        return Results.NotFound(new { error = "Misdirected payment not found" });
+
+    payment.Status = "RESOLVED";
+    payment.ResolvedAt = DateTimeOffset.UtcNow;
+    payment.ResolutionNote = req.ResolutionNote;
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new { id, status = "RESOLVED", resolutionNote = req.ResolutionNote });
+})
+.WithTags("Reconciliation").WithName("ResolveMisdirectedPayment")
+.WithSummary("Mark a misdirected payment as resolved with a resolution note.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
 app.MapGet("/transactions", async (
     LedgerQueryService queries, string? status, string? accountId, int page = 1, int pageSize = 50) =>
     Results.Ok(await queries.GetTransactionsAsync(status, accountId, page, pageSize)))
 .WithTags("Reporting").WithName("ListTransactions")
 .WithSummary("Paged transaction history. Filter by status (PENDING/SUCCESS/FAILED/OVERPAYMENT/UNDERPAYMENT/MISDIRECTED/KYC_LIMIT_EXCEEDED) or accountId. KYC_LIMIT_EXCEEDED fires when a tier-1 account exceeds ₦50k/day or tier-2 exceeds ₦200k/day.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// List payment plans (partial payment tracking)
+app.MapGet("/payment-plans", async (LedgerDbContext db, string? status, int page = 1, int pageSize = 50) =>
+{
+    var query = db.PaymentPlans.AsQueryable();
+
+    if (!string.IsNullOrEmpty(status))
+        query = query.Where(p => p.Status == status);
+
+    var total = await query.CountAsync();
+    var items = await query
+        .OrderByDescending(p => p.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync();
+
+    return Results.Ok(new { total, page, pageSize, items });
+})
+.WithTags("Payments").WithName("ListPaymentPlans")
+.WithSummary("List payment plans tracking partial/multi-installment payments. Filter by status (PENDING/COMPLETED/ABANDONED).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Get a specific payment plan
+app.MapGet("/payment-plans/{id:guid}", async (Guid id, LedgerDbContext db) =>
+{
+    var plan = await db.PaymentPlans.FindAsync(id);
+    return plan is null
+        ? Results.NotFound(new { error = "Payment plan not found" })
+        : Results.Ok(plan);
+})
+.WithTags("Payments").WithName("GetPaymentPlan")
+.WithSummary("Get details of a specific payment plan including total expected, received, and remaining balance.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// List transactions with reversal status
+app.MapGet("/transactions/reversals", async (LedgerDbContext db, int page = 1, int pageSize = 50) =>
+{
+    var total = await db.Transactions.Where(t => t.Status == "REVERSED").CountAsync();
+    var reversals = await db.Transactions
+        .Where(t => t.Status == "REVERSED")
+        .OrderByDescending(t => t.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .ToListAsync();
+
+    return Results.Ok(new
+    {
+        total,
+        page,
+        pageSize,
+        items = reversals.Select(t => new
+        {
+            t.Id,
+            t.ReferenceCode,
+            t.Status,
+            t.AccountId,
+            t.Amount,
+            t.CreatedAt
+        })
+    });
+})
+.WithTags("Reporting").WithName("ListReversals")
+.WithSummary("List all reversed transactions with their details.")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
 // Settlement file reconciliation: accepts a CSV (reference,amount,status) from a
@@ -438,6 +979,121 @@ app.MapPost("/reconcile/settlement", async (HttpRequest request, LedgerDbContext
 .WithSummary("Match a provider settlement CSV (reference,amount,status) against the internal ledger. Returns matched, mismatched, and unknown rows with a match-rate percentage.")
 .AddEndpointFilter<ApiKeyEndpointFilter>();
 
+// List reconciliation exceptions, optionally filtered by status
+app.MapGet("/exceptions", async (LedgerDbContext db, string? status, int page = 1, int pageSize = 50) =>
+{
+    var query = db.ReconciliationExceptions.AsQueryable();
+
+    if (!string.IsNullOrEmpty(status))
+        query = query.Where(e => e.Status == status);
+
+    var total = await query.CountAsync();
+    var exceptions = await query
+        .OrderByDescending(e => e.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(e => new
+        {
+            e.Id,
+            e.TransactionRef,
+            e.ExceptionType,
+            e.ErrorMessage,
+            e.AiDiagnosis,
+            e.AiRecommendation,
+            e.AiConfidence,
+            e.Status,
+            e.CreatedAt,
+            e.ResolvedAt
+        })
+        .ToListAsync();
+
+    return Results.Ok(new { total, page, pageSize, exceptions });
+})
+.WithTags("Reconciliation").WithName("ListExceptions")
+.WithSummary("List reconciliation exceptions, optionally filtered by status (PENDING/APPROVED/REJECTED/RESOLVED).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Get exception details
+app.MapGet("/exceptions/{id:guid}", async (Guid id, LedgerDbContext db) =>
+{
+    var exception = await db.ReconciliationExceptions.FindAsync(id);
+    return exception is null
+        ? Results.NotFound(new { error = "Exception not found" })
+        : Results.Ok(exception);
+})
+.WithTags("Reconciliation").WithName("GetException")
+.WithSummary("Get detailed information about a reconciliation exception, including LLM analysis.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Approve an exception and execute the recommended action
+app.MapPatch("/exceptions/{id:guid}/approve", async (
+    Guid id,
+    LedgerDbContext db,
+    PaymentService payments,
+    ILogger<Program> logger) =>
+{
+    var exception = await db.ReconciliationExceptions.FindAsync(id);
+    if (exception is null)
+        return Results.NotFound(new { error = "Exception not found" });
+
+    if (exception.Status == "RESOLVED")
+        return Results.BadRequest(new { error = "Exception already resolved" });
+
+    exception.Status = "APPROVED";
+    exception.ResolvedAt = DateTimeOffset.UtcNow;
+    exception.ApprovedBy = "operator"; // In production, use actual user context
+
+    // Parse recommendation and execute if it's a settle action
+    if (exception.AiRecommendation?.Contains("Settle") == true &&
+        !string.IsNullOrEmpty(exception.TransactionRef))
+    {
+        try
+        {
+            var tx = await db.Transactions
+                .FirstOrDefaultAsync(t => t.ReferenceCode == exception.TransactionRef);
+            if (tx != null)
+            {
+                await payments.SettleAsync(exception.TransactionRef, tx.Amount, tx.AccountId ?? "UNKNOWN");
+                exception.ResolutionAction = "Executed settlement";
+                logger.LogInformation("Exception {Id} approved and settled", id);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to execute settlement for exception {Id}", id);
+            exception.ResolutionAction = $"Settlement failed: {ex.Message}";
+        }
+    }
+    else
+    {
+        exception.ResolutionAction = "Approved for manual review";
+    }
+
+    await db.SaveChangesAsync();
+    return Results.Ok(new { id, status = "APPROVED", action = exception.ResolutionAction });
+})
+.WithTags("Reconciliation").WithName("ApproveException")
+.WithSummary("Approve an exception and execute the recommended remediation action.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+// Reject an exception
+app.MapPatch("/exceptions/{id:guid}/reject", async (Guid id, LedgerDbContext db) =>
+{
+    var exception = await db.ReconciliationExceptions.FindAsync(id);
+    if (exception is null)
+        return Results.NotFound(new { error = "Exception not found" });
+
+    exception.Status = "REJECTED";
+    exception.ResolvedAt = DateTimeOffset.UtcNow;
+    exception.ApprovedBy = "operator";
+
+    await db.SaveChangesAsync();
+    return Results.Ok(new { id, status = "REJECTED" });
+})
+.WithTags("Reconciliation").WithName("RejectException")
+.WithSummary("Reject a reconciliation exception (mark as REJECTED).")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
 app.MapGet("/health", async (LedgerDbContext db, IConnectionMultiplexer redis) =>
 {
     var postgresOk = await db.Database.CanConnectAsync();
@@ -476,6 +1132,54 @@ app.MapGet("/metrics", async (LedgerQueryService queries, IConnectionMultiplexer
 .WithTags("Reporting").WithName("GetMetrics")
 .WithSummary("Audit-ready ledger metrics: transaction mix, double-entry balance invariant (balanced=true proves credits==debits), and reconciliation backlog.");
 
+app.MapGet("/customers/{customerId}/kyc-history", async (
+    string customerId,
+    AuditService audit,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    var history = await audit.GetKycTierHistoryAsync(customerId, from, to);
+    return Results.Ok(new { customerId, history, count = history.Count });
+})
+.WithTags("Audit").WithName("GetKycHistory")
+.WithSummary("Get KYC tier change history for a customer.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/customers/{customerId}/identity-history", async (
+    string customerId,
+    AuditService audit,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    var history = await audit.GetIdentityHistoryAsync(customerId, "customer", from, to);
+    return Results.Ok(new { customerId, history, count = history.Count });
+})
+.WithTags("Audit").WithName("GetCustomerIdentityHistory")
+.WithSummary("Get name change history for a customer.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapGet("/account/{accountRef}/identity-history", async (
+    string accountRef,
+    AuditService audit,
+    DateTimeOffset? from,
+    DateTimeOffset? to) =>
+{
+    var history = await audit.GetIdentityHistoryAsync(accountRef, "virtual_account", from, to);
+    return Results.Ok(new { accountRef, history, count = history.Count });
+})
+.WithTags("Audit").WithName("GetAccountIdentityHistory")
+.WithSummary("Get account name change history.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapPost("/demo/settlement-accuracy", async (DemoService demo) =>
+{
+    var report = await demo.GenerateSettlementAccuracyReportAsync();
+    return Results.Ok(report);
+})
+.WithTags("Demo").WithName("DemoSettlementAccuracy")
+.WithSummary("Demonstrate zero-mismatch settlement reconciliation with 20 test transactions, full ledger posting, and reconciliation proof.")
+.AddEndpointFilter<ApiKeyEndpointFilter>();
+
 app.Run();
 
 static (string? EventType, string? RequestId) ParseEnvelope(string body)
@@ -507,6 +1211,13 @@ static bool IsMoneyInEvent(string? eventType)
         || e.Contains("funded")                              // virtual_account.funded
         || e.Contains("credit")                              // virtual.account.credit (legacy)
         || (e.Contains("debit") && e.Contains("success"));   // mandate.debit_success
+}
+
+static bool IsReversalEvent(string? eventType)
+{
+    if (string.IsNullOrEmpty(eventType)) return false;
+    var e = eventType.ToLowerInvariant();
+    return e.Contains("reversal") || e.Contains("chargeback") || e.Contains("refund");
 }
 
 // Nomba signs webhooks by concatenating specific transaction fields (not the raw
